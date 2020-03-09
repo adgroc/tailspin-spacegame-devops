@@ -1,0 +1,487 @@
+trigger:
+  batch: true
+  branches:
+    include:
+    - master
+
+variables:
+  buildConfiguration: 'Release'
+  dotnetSdkVersion: '3.1.100'
+
+stages:
+  - stage: 'Build'
+    displayName: 'Build web app and db'
+    jobs:
+
+    #Build the web application
+    - job: 'Build'
+      displayName: 'Build web app'
+      pool:
+        vmImage: 'ubuntu-16.04'
+        demands:
+          - npm
+
+      variables:
+        wwwrootDir: 'Tailspin.SpaceGame.Web/wwwroot'
+        dotnetSdkVersion: '3.1.100'
+
+      #Install required version of .net core
+      steps:
+      - task: DotNetCoreInstaller@2
+        displayName: 'Use .NET Core SDK $(dotnetSdkVersion)'
+        inputs:
+          version: '$(dotnetSdkVersion)'
+
+      #Run npm install
+      - task: Npm@1
+        displayName: 'Run npm install'
+        inputs:
+          verbose: false
+
+      #Compile Sass assets
+      - script: './node_modules/.bin/node-sass $(wwwrootDir) --output $(wwwrootDir)'
+        displayName: 'Compile Sass assets'
+
+      #Run gulp tasks
+      - task: gulp@1
+        displayName: 'Run gulp tasks'
+
+      #Write out build info
+      - script: 'echo "$(Build.DefinitionName), $(Build.BuildId), $(Build.BuildNumber)" > buildinfo.txt'
+        displayName: 'Write build info'
+        workingDirectory: $(wwwrootDir)
+
+      #Restore project dependencies
+      - task: DotNetCoreCLI@2
+        displayName: 'Restore project dependencies'
+        inputs:
+          command: 'restore'
+          projects: '**/*.csproj'
+
+      #Build the web application project
+      - task: DotNetCoreCLI@2
+        displayName: 'Build the project - $(buildConfiguration)'
+        inputs:
+          command: 'build'
+          arguments: '--no-restore --configuration $(buildConfiguration)'
+          projects: '**/*.csproj'
+
+      #Install the report generator tool used for code coverage
+      - task: DotNetCoreCLI@2
+        displayName: 'Install ReportGenerator'
+        inputs:
+          command: custom
+          custom: tool
+          arguments: 'install --global dotnet-reportgenerator-globaltool'
+      
+      #Run unit tests, capturing code coverage metrics
+      - task: DotNetCoreCLI@2
+        displayName: 'Run unit tests - $(buildConfiguration)'
+        inputs:
+          command: 'test'
+          arguments: '--no-build --configuration $(buildConfiguration) /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura /p:CoverletOutput=$(Build.SourcesDirectory)/TestResults/Coverage/'
+          publishTestResults: true
+          projects: '**/*.Tests.csproj'
+      
+      #Create code coverage report
+      - script: |
+          reportgenerator -reports:$(Build.SourcesDirectory)/**/coverage.cobertura.xml -targetdir:$(Build.SourcesDirectory)/CodeCoverage -reporttypes:HtmlInline_AzurePipelines
+        displayName: 'Create code coverage report'
+      
+      #Publish code coverage report
+      - task: PublishCodeCoverageResults@1
+        displayName: 'Publish code coverage report'
+        inputs:
+          codeCoverageTool: 'cobertura'
+          summaryFileLocation: '$(Build.SourcesDirectory)/**/coverage.cobertura.xml'
+
+      #Publish the project
+      - task: DotNetCoreCLI@2
+        displayName: 'Publish the project - $(buildConfiguration)'
+        inputs:
+          command: 'publish'
+          projects: '$(System.DefaultWorkingDirectory)/**/Tailspin.SpaceGame.Web.csproj'
+          publishWebProjects: false
+          arguments: '--no-build --configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/$(buildConfiguration)'
+          zipAfterPublish: true
+
+      #Run WhiteSource Bolt
+      - task: WhiteSource Bolt@20
+        displayName: 'Run WhiteSource Bolt'
+
+      #Publish build artifacts
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Artifact: drop'
+        condition: succeeded()
+
+    #Build the dacpac file for database deployment
+    - job: BuildDacpac
+      displayName: "Build dacpac"
+      dependsOn: Build
+      pool:
+        vmImage: 'windows-2019'
+
+      #Restore project dependencies
+      steps:
+      - task: DotNetCoreCLI@2
+        displayName: 'Restore project dependencies'
+        inputs:
+          command: 'restore'
+          projects: '**/*.csproj'
+    
+      #Build the database project
+      - task: VSBuild@1
+        displayName: 'Build the database project'
+        inputs:
+          project: '**/*.sqlproj'
+    
+      #Copy dacpac to staging directory
+      - task: CopyFiles@2
+        displayName: 'Copy dacpac file to staging directory'
+        inputs:
+          contents: |
+            Tailspin.SpaceGame.Database/bin/**/*.dacpac
+          targetFolder: '$(Build.StagingDirectory)'
+    
+      #Publish dacpac 
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Artifact'
+        inputs:
+          pathToPublish: '$(Build.ArtifactStagingDirectory)'
+          artifactName: dropDacpac
+        condition: succeededOrFailed()
+
+    #Scrip sql schema changes
+    - job: BuildScriptSqlSchemaChanges
+      displayName: 'Build script for sql schema changes'
+      dependsOn: BuildDacpac
+      pool:
+        vmImage: 'windows-2019'
+      variables:
+      - group: 'Release'
+      steps:
+      - download: current
+        artifact: dropDacpac
+        patterns: '**/*'
+      - task: SqlAzureDacpacDeployment@1
+        displayName: Generate schema change script
+        inputs:
+          azureSubscription: 'Resource Manager - Tailspin - Space Game'
+          authenticationType: 'server'
+          serverName: '$(servername).database.windows.net'
+          databaseName: '$(databasename-r0)'
+          sqlUsername: '$(adminlogin)'
+          sqlPassword: '$(adminPassword)'
+          deployType: 'DacpacTask'
+          deploymentAction: 'Script'
+          dacpacFile: '$(Pipeline.Workspace)/dropDacpac/Tailspin.SpaceGame.Database/bin/Debug/Tailspin.SpaceGame.Database.dacpac'
+          ipDetectionMethod: 'AutoDetect'
+      - task: PowerShell@2
+        displayName: Show Auto Generated SQL Script
+        inputs:
+          targetType: 'inline'
+          script: | 
+            Write-Host "Auto Generated SQL Update Script:"
+            Get-Content d:\a\1\s\GeneratedOutputFiles\$(databasename-r0)_Script.sql | foreach {Write-Output $_}
+      - task: PowerShell@2
+        displayName: Show change script and check for schema changes
+        inputs:
+          targetType: 'inline'
+          script: | 
+            # Print the schema change script
+            Write-Host "Auto Generated SQL Update Script:"
+            Get-Content d:\a\1\s\GeneratedOutputFiles\$(databasename-r0)_Script.sql | foreach {Write-Output $_}
+
+            # Check for schema changes
+            $file = Get-Content "d:\a\1\s\GeneratedOutputFiles\$(databasename-r0)_Script.sql"
+            $containsWord = $file | %{$_ -match "CREATE" -or $_ -match "ALTER" -or $_ -match "DROP"}
+            if ($containsWord -contains $true) {
+              Install-Module VSTeam -Scope CurrentUser -Force
+              Set-VSTeamAccount –Account $(Acct) -PersonalAccessToken $(PAT)
+              $methodParameters = @{
+                ProjectName = "$(System.TeamProject)"
+                Name = "Release"}
+              $vg = Get-VSTeamVariableGroup @methodParameters
+              $vars = @{}
+              $vg.variables | Get-Member -MemberType *Property | %{$vars.($_.Name) = $vg.variables.($_.Name)}
+              $varName = "schemaChanged"
+              $vars.$varName= @{}
+              $vars.$varName.value = "True"
+              $vars.$varName.isSecret = $false
+              $methodParameters = @{
+                id = $vg.id
+                ProjectName = "$(System.TeamProject)"
+                Name = "Release"
+                Description = ""
+                Type = "Vsts"
+                Variables = $vars}
+              Update-VSTeamVariableGroup @methodParameters}
+
+  #Deploy db to ring 0
+  - stage: DeployDbR0
+    displayName: 'Ring 0 - Db'
+    dependsOn: Build
+    jobs:
+    - deployment: DatabaseSchemaChangesR0
+      pool:
+        vmImage: 'windows-2019'
+      variables:
+      - group: 'Release'
+      environment: 'db-r0'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - download: current
+              artifact: dropDacpac
+              patterns: '**/*'
+            - task: SqlAzureDacpacDeployment@1
+              displayName: 'Deploy SQL schema'
+              inputs:
+                azureSubscription: 'Resource Manager - Tailspin - Space Game'
+                authenticationType: 'server'
+                serverName: '$(servername).database.windows.net'
+                databaseName: '$(databasename-r0)'
+                sqlUsername: '$(adminlogin)'
+                sqlPassword: '$(adminPassword)'
+                deployType: 'DacpacTask'
+                deploymentAction: 'Publish'
+                dacpacFile: '$(Pipeline.Workspace)/dropDacpac/Tailspin.SpaceGame.Database/bin/Debug/Tailspin.SpaceGame.Database.dacpac'
+                ipDetectionMethod: 'AutoDetect'
+
+  #Deploy web app to ring 0
+  - stage: DeployWebR0
+    displayName: 'Ring 0 - Web App'
+    dependsOn: Build
+    jobs:
+    - deployment: DeployWebR0
+      pool:
+        vmImage: 'ubuntu-16.04'
+      environment: web-r0
+      variables:
+      - group: Release
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - download: current
+              artifact: drop
+            - task: AzureWebApp@1
+              displayName: 'Azure App Service Deploy: website'
+              inputs:
+                azureSubscription: 'Resource Manager - Tailspin - Space Game'
+                appName: '$(WebAppName-r0)'
+                package: '$(Pipeline.Workspace)/drop/$(buildConfiguration)/*Web.zip'
+
+    - job: RunUITests
+      dependsOn: DeployWebR0
+      displayName: 'Run UI tests via Selenium'
+      pool:
+        vmImage: 'windows-2019'
+      variables:
+      - group: 'Release'
+      steps: 
+      - task: UseDotNet@2
+        displayName: 'Use .NET Core SDK $(dotnetSdkVersion)'
+        inputs:
+          version: '$(dotnetSdkVersion)'
+      - task: DotNetCoreCLI@2
+        displayName: 'Build the project - $(buildConfiguration)'
+        inputs:
+          command: 'build'
+          arguments: '--configuration $(buildConfiguration)'
+          projects: '$(System.DefaultWorkingDirectory)/**/*UITests.csproj'
+      - task: DotNetCoreCLI@2
+        displayName: 'Run unit tests - $(buildConfiguration)'
+        inputs:
+          command: 'test'
+          arguments: '--no-build --configuration $(buildConfiguration)'
+          publishTestResults: true
+          projects: '$(System.DefaultWorkingDirectory)/**/*UITests.csproj'
+
+    #Run load tests via Jmeter in ring 0
+    - job: RunLoadTestsR0
+      dependsOn: DeployWebR0
+      displayName: 'Run load tests via Jmeter'
+      pool:
+        vmImage: 'ubuntu-16.04'
+      variables:
+        jmeterVersion: '5.2'
+      steps: 
+      - script: |
+          wget -c ftp.ps.pl/pub/apache/jmeter/binaries/apache-jmeter-$(jmeterVersion).tgz
+          tar -xf apache-jmeter-$(jmeterVersion).tgz
+        displayName: 'Install Apache JMeter'
+      - script: apache-jmeter-$(jmeterVersion)/bin/./jmeter -n -t LoadTest.jmx -o Results.xml -Jhostname=$(R0_HOSTNAME)
+        displayName: 'Run Load tests'
+      - script: |
+          sudo apt-get update
+          sudo apt-get install xsltproc
+          xsltproc JMeter2JUnit.xsl Results.xml > JUnit.xml
+        displayName: 'Transform JMeter output to JUnit'
+      - task: PublishTestResults@2
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: JUnit.xml
+
+ #Deploy db to ring 1
+  - stage: DeployDbR1
+    displayName: 'Ring 1 - Db'
+    dependsOn: DeployDbR0
+    jobs:
+    - deployment: DatabaseSchemaChangesR1
+      pool:
+        vmImage: 'windows-2019'
+      variables:
+      - group: 'Release'
+      environment: 'db-r1'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - download: current
+              artifact: dropDacpac
+              patterns: '**/*'
+            - task: SqlAzureDacpacDeployment@1
+              displayName: 'Deploy SQL schema'
+              inputs:
+                azureSubscription: 'Resource Manager - Tailspin - Space Game'
+                authenticationType: 'server'
+                serverName: '$(servername).database.windows.net'
+                databaseName: '$(databasename-r1)'
+                sqlUsername: '$(adminlogin)'
+                sqlPassword: '$(adminPassword)'
+                deployType: 'DacpacTask'
+                deploymentAction: 'Publish'
+                dacpacFile: '$(Pipeline.Workspace)/dropDacpac/Tailspin.SpaceGame.Database/bin/Debug/Tailspin.SpaceGame.Database.dacpac'
+                ipDetectionMethod: 'AutoDetect'
+
+  #Deploy web app to ring 1
+  - stage: DeployWebR1
+    displayName: 'Ring 1 - Web App'
+    dependsOn: DeployWebR0
+    jobs:
+    - deployment: DeployWebR1
+      pool:
+        vmImage: 'ubuntu-16.04'
+      environment: web-r1
+      variables:
+      - group: Release
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - download: current
+              artifact: drop
+            - task: AzureWebApp@1
+              displayName: 'Azure App Service Deploy: website'
+              inputs:
+                azureSubscription: 'Resource Manager - Tailspin - Space Game'
+                appName: '$(WebAppName-r1)'
+                package: '$(Pipeline.Workspace)/drop/$(buildConfiguration)/*Web.zip'
+
+    #Run load tests via Jmeter in ring 1
+    - job: RunLoadTestsR1
+      dependsOn: DeployWebR1
+      displayName: 'Run load tests via Jmeter'
+      pool:
+        vmImage: 'ubuntu-16.04'
+      variables:
+        jmeterVersion: '5.2'
+      steps: 
+      - script: |
+          wget -c ftp.ps.pl/pub/apache/jmeter/binaries/apache-jmeter-$(jmeterVersion).tgz
+          tar -xf apache-jmeter-$(jmeterVersion).tgz
+        displayName: 'Install Apache JMeter'
+      - script: apache-jmeter-$(jmeterVersion)/bin/./jmeter -n -t LoadTest.jmx -o Results.xml -Jhostname=$(R1_HOSTNAME)
+        displayName: 'Run Load tests'
+      - script: |
+          sudo apt-get update
+          sudo apt-get install xsltproc
+          xsltproc JMeter2JUnit.xsl Results.xml > JUnit.xml
+        displayName: 'Transform JMeter output to JUnit'
+      - task: PublishTestResults@2
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: JUnit.xml
+
+ #Deploy db to ring 2
+  - stage: DeployDbR2
+    displayName: 'Ring 2 - Db'
+    dependsOn: DeployDbR1
+    jobs:
+    - deployment: DatabaseSchemaChangesR2
+      pool:
+        vmImage: 'windows-2019'
+      variables:
+      - group: 'Release'
+      environment: 'db-r2'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - download: current
+              artifact: dropDacpac
+              patterns: '**/*'
+            - task: SqlAzureDacpacDeployment@1
+              displayName: 'Deploy SQL schema'
+              inputs:
+                azureSubscription: 'Resource Manager - Tailspin - Space Game'
+                authenticationType: 'server'
+                serverName: '$(servername).database.windows.net'
+                databaseName: '$(databasename-r2)'
+                sqlUsername: '$(adminlogin)'
+                sqlPassword: '$(adminPassword)'
+                deployType: 'DacpacTask'
+                deploymentAction: 'Publish'
+                dacpacFile: '$(Pipeline.Workspace)/dropDacpac/Tailspin.SpaceGame.Database/bin/Debug/Tailspin.SpaceGame.Database.dacpac'
+                ipDetectionMethod: 'AutoDetect'
+
+  #Deploy web app to ring 2
+  - stage: DeployWebR2
+    displayName: 'Ring 2 - Web App'
+    dependsOn: DeployWebR1
+    jobs:
+    - deployment: DeployWebR2
+      pool:
+        vmImage: 'ubuntu-16.04'
+      environment: web-r2
+      variables:
+      - group: Release
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - download: current
+              artifact: drop
+            - task: AzureWebApp@1
+              displayName: 'Azure App Service Deploy: website'
+              inputs:
+                azureSubscription: 'Resource Manager - Tailspin - Space Game'
+                appName: '$(WebAppName-r2)'
+                package: '$(Pipeline.Workspace)/drop/$(buildConfiguration)/*Web.zip'
+    
+    #Run load tests via Jmeter in ring 2
+    - job: RunLoadTestsR2
+      dependsOn: DeployWebR2
+      displayName: 'Run load tests via Jmeter'
+      pool:
+        vmImage: 'ubuntu-16.04'
+      variables:
+        jmeterVersion: '5.2'
+      steps: 
+      - script: |
+          wget -c ftp.ps.pl/pub/apache/jmeter/binaries/apache-jmeter-$(jmeterVersion).tgz
+          tar -xf apache-jmeter-$(jmeterVersion).tgz
+        displayName: 'Install Apache JMeter'
+      - script: apache-jmeter-$(jmeterVersion)/bin/./jmeter -n -t LoadTest.jmx -o Results.xml -Jhostname=$(R2_HOSTNAME)
+        displayName: 'Run Load tests'
+      - script: |
+          sudo apt-get update
+          sudo apt-get install xsltproc
+          xsltproc JMeter2JUnit.xsl Results.xml > JUnit.xml
+        displayName: 'Transform JMeter output to JUnit'
+      - task: PublishTestResults@2
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: JUnit.xml
